@@ -26,8 +26,8 @@ A complete Wave Function Collapse toolkit for procedural tile map generation. Cr
 - ✅ **Validation** — Instant feedback on incomplete or invalid rule sets
 - 💾 **Export .tr files** — Self-contained tile rule archives
 
-
 [<img src="misc/atlas_editor.jpg" alt="Main Window Screenshot" />](## "Atlas Editor")  
+
 ### WFC Viewer
 
 - 📂 **Load .tr files** — Parse tile rule archives created by the Atlas Editor
@@ -39,7 +39,7 @@ A complete Wave Function Collapse toolkit for procedural tile map generation. Cr
 - 🖼️ **Export PNG** — Render the final grid as a single image
 - 💾 **Save .tm files** — Export complete tile maps with embedded images
 
-[<img src="misc/viewer.jpg" alt="Main Window Screenshot" />](## "WFC Viewer)  
+[<img src="misc/viewer.jpg" alt="Main Window Screenshot" />](## "WFC Viewer")  
 
 
 ---
@@ -63,11 +63,8 @@ cd wfc-toolkit
 2. **Install dependencies**
 
 ```bash
-# For Atlas Editor
-pip install -r atlas_editor/requirements.txt
-
-# For WFC Viewer
-pip install -r wfc_viewer/requirements.txt
+# For both Atlas Editor and WFC Viewer
+pip install -r requirements.txt
 ```
 
 ### Running the Applications
