@@ -4,6 +4,8 @@ Wave Function Collapse engine with pause/resume support.
 
 import random
 from enum import Enum, auto
+from collections import deque
+from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
@@ -42,6 +44,28 @@ class CellState:
         return len(self.possibilities)
 
 
+@dataclass
+class NeighborConstraint:
+    """What one collapsed neighbour allows a cell to be."""
+    side: str
+    pos: Tuple[int, int]
+    tile_id: str
+    locked: bool
+    allowed: Set[str]  # tiles the cell may take because of this neighbour
+    neighbor_permits: Set[str]  # tiles the neighbour allows on the side facing the cell
+    cell_permits: Set[str]  # tiles that list the neighbour on the side facing the neighbour
+
+
+@dataclass
+class Decision:
+    """One random collapse choice, kept so it can be undone on contradiction."""
+    pos: Tuple[int, int]
+    options: List[str]
+    tried: Set[str] = field(default_factory=set)
+    # First-touched state per cell during this decision: pos -> (possibilities, collapsed_tile)
+    changes: Dict[Tuple[int, int], Tuple[Set[str], Optional[str]]] = field(default_factory=dict)
+
+
 class WFCEngine(QObject):
     """
     Wave Function Collapse algorithm with real-time visualization support.
@@ -61,7 +85,13 @@ class WFCEngine(QObject):
     state_changed = Signal(EngineState)
     finished = Signal(bool)
     progress_updated = Signal(int, int)
-    
+    stuck = Signal(int, int)  # run paused: retries made no progress near (x, y)
+    auto_start = Signal(int, int)  # run stuck; continuing from the new start cell (x, y)
+
+    MAX_BACKTRACKS = 2000
+    STUCK_RETRIES = 200  # retries without new progress before the run moves elsewhere
+    MAX_AUTO_JUMPS = 10  # automatic restarts without progress before the run pauses
+
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -77,7 +107,22 @@ class WFCEngine(QObject):
         
         self._collapsed_count = 0
         self._total_cells = 0
-    
+
+        self._history: List[Decision] = []
+        self._backtracks = 0
+        self._dead: Set[Tuple[int, int]] = set()  # crosses the run skips
+        self._best_collapsed = -1
+        self._retries_since_best = 0
+        self._starts: List[Tuple[int, int]] = []  # cells the user marked while paused
+        self._auto_start: Optional[Tuple[int, int]] = None  # start chosen automatically when stuck
+        self._jumps_since_best = 0
+        self._start_dist: Dict[Tuple[int, int], int] = {}  # steps from the nearest start
+
+    @property
+    def backtracks(self) -> int:
+        """Number of backtracking retries since the last manual edit or reset."""
+        return self._backtracks
+
     @property
     def state(self) -> EngineState:
         return self._state
@@ -109,6 +154,10 @@ class WFCEngine(QObject):
         self.cells.clear()
         self._collapsed_count = 0
         self._total_cells = width * height
+        self._dead = set()
+        self._auto_start = None
+        self._set_starts([])
+        self._clear_history()
         
         # Get all enabled tile IDs
         enabled_tiles = atlas.get_enabled_tile_ids()
@@ -124,20 +173,30 @@ class WFCEngine(QObject):
         self.state = EngineState.IDLE
         self.progress_updated.emit(0, self._total_cells)
     
-    def lock_cell(self, x: int, y: int, tile_id: str):
+    def lock_cell(self, x: int, y: int, tile_id: str, start_point: bool = False):
         """
         Lock a cell to a specific tile (user-placed constraint).
         This also propagates constraints to neighbors.
+        start_point: the solver grows outward from this cell first.
         """
         if (x, y) not in self.cells:
             return
-        
+
+        # Manual edits invalidate the decision history
+        self._clear_history()
+        self._dead.discard((x, y))
+        if self.state in (EngineState.FINISHED, EngineState.CONTRADICTION):
+            self.state = EngineState.IDLE
+
         cell = self.cells[(x, y)]
+        was_collapsed = cell.is_collapsed
         cell.collapsed_tile = tile_id
         cell.locked = True
         cell.possibilities = {tile_id}
-        
-        if not cell.is_collapsed or cell.collapsed_tile != tile_id:
+        if start_point:
+            self._set_starts(self._starts + [(x, y)])
+
+        if not was_collapsed:
             self._collapsed_count += 1
         
         self.cell_collapsed.emit(x, y, tile_id)
@@ -150,7 +209,12 @@ class WFCEngine(QObject):
         """Unlock a cell and restore its possibilities."""
         if (x, y) not in self.cells:
             return
-        
+
+        # Manual edits invalidate the decision history
+        self._clear_history()
+        self._dead.discard((x, y))
+        self._drop_starts([(x, y)])
+
         cell = self.cells[(x, y)]
         was_collapsed = cell.is_collapsed
         was_contradiction = len(cell.possibilities) == 0
@@ -175,6 +239,60 @@ class WFCEngine(QObject):
             if self.cells[(nx, ny)].is_collapsed:
                 self._propagate(nx, ny)
     
+    def clear_cell_and_forcing_neighbors(self, x: int, y: int) -> Tuple[List[Tuple[int, int]], int]:
+        """
+        Clear a cell so it can take a different tile. If its neighbours leave it at most one option,
+        also clear the fewest neighbours needed to free it. Cleared cells stay empty; propagation
+        does not refill them.
+        Returns (cleared positions, how many of them were locked).
+        """
+        if (x, y) not in self.cells or self.atlas is None:
+            return [], 0
+
+        enabled = self.atlas.get_enabled_tile_ids()
+        constraints = sorted(self.get_neighbor_constraints(x, y), key=lambda c: len(c.allowed))
+
+        def open_options(ignored: Set[Tuple[int, int]]) -> Set[str]:
+            options = set(enabled)
+            for c in constraints:
+                if c.pos not in ignored:
+                    options &= c.allowed
+            return options
+
+        ignored: Set[Tuple[int, int]] = set()
+        for c in constraints:
+            if len(open_options(ignored)) > 1:
+                break
+            ignored.add(c.pos)
+
+        to_clear = [(x, y)] + sorted(ignored)
+        locked_count = 0
+        for pos in to_clear:
+            cell = self.cells[pos]
+            if cell.is_collapsed:
+                self._collapsed_count -= 1
+            if cell.locked:
+                locked_count += 1
+            cell.locked = False
+            cell.collapsed_tile = None
+            cell.possibilities = set(enabled)
+
+        self._drop_starts(to_clear)
+
+        # Recompute options for every open cell from the placed cells that remain
+        for cell in self.cells.values():
+            if not cell.is_collapsed:
+                cell.possibilities = self.get_valid_tiles_for_cell(cell.x, cell.y)
+
+        self._clear_history()
+        if self.state in (EngineState.FINISHED, EngineState.CONTRADICTION):
+            self.state = EngineState.IDLE
+
+        for pos in to_clear:
+            self.cell_updated.emit(pos[0], pos[1])
+        self.progress_updated.emit(self._collapsed_count, self._total_cells)
+        return to_clear, locked_count
+
     def start(self):
         """Start or resume the collapse process."""
         if self.state in (EngineState.FINISHED, EngineState.CONTRADICTION):
@@ -228,33 +346,32 @@ class WFCEngine(QObject):
     def _step(self):
         """Perform one collapse iteration."""
         # Find cell with lowest entropy (most constrained)
-        min_entropy = float('inf')
+        best_key = None
         candidates = []
         
         for pos, cell in self.cells.items():
-            if cell.is_collapsed:
+            if cell.is_collapsed or pos in self._dead:
                 continue
             
             entropy = cell.entropy
             if entropy == 0:
                 # Contradiction - no possibilities left
-                self._timer.stop()
-                self.state = EngineState.CONTRADICTION
-                self.contradiction_found.emit(pos[0], pos[1])
-                self.finished.emit(False)
+                self._backtrack(pos)
                 return
             
-            if entropy < min_entropy:
-                min_entropy = entropy
+            # Grow outward from user start points first; with none, this is entropy alone
+            key = (self._start_dist.get(pos, 0), entropy)
+            if best_key is None or key < best_key:
+                best_key = key
                 candidates = [pos]
-            elif entropy == min_entropy:
+            elif key == best_key:
                 candidates.append(pos)
         
         if not candidates:
-            # All cells collapsed - success!
+            # Every open cell is collapsed; crosses, if any, are reported as unresolved
             self._timer.stop()
             self.state = EngineState.FINISHED
-            self.finished.emit(True)
+            self.finished.emit(not self.cross_positions())
             return
         
         # Pick random cell among lowest entropy candidates
@@ -280,27 +397,207 @@ class WFCEngine(QObject):
             valid_now &= i_allow
         
         if not valid_now:
-            # Contradiction
-            self._timer.stop()
-            self.state = EngineState.CONTRADICTION
-            self.contradiction_found.emit(x, y)
-            self.finished.emit(False)
+            self._backtrack((x, y))
             return
-        
-        # Pick from the verified valid set
-        tile_id = random.choice(list(valid_now))
-        
-        # Collapse the cell
+
+        # Record the decision so it can be undone, then collapse it
+        decision = Decision(pos=(x, y), options=list(valid_now))
+        self._history.append(decision)
+        contradiction = self._apply_choice(decision, random.choice(decision.options))
+        if contradiction is not None:
+            self._backtrack(contradiction)
+        else:
+            self._note_progress()
+
+    def _apply_choice(self, decision: Decision, tile_id: str) -> Optional[Tuple[int, int]]:
+        """Collapse the decision's cell to tile_id and propagate. Returns a contradiction position, if any."""
+        x, y = decision.pos
+        decision.tried.add(tile_id)
+
+        cell = self.cells[(x, y)]
+        self._record(cell)
         cell.collapsed_tile = tile_id
         cell.possibilities = {tile_id}
         self._collapsed_count += 1
-        
+
         self.cell_collapsed.emit(x, y, tile_id)
         self.progress_updated.emit(self._collapsed_count, self._total_cells)
-        
-        # Propagate constraints
-        self._propagate(x, y)
+
+        return self._propagate(x, y)
+
+    def _backtrack(self, pos: Tuple[int, int]):
+        """
+        Undo decisions until one has an untried option that works.
+        Gives up (showing a contradiction at pos) when history runs out or the retry limit is hit.
+        """
+        while self._history:
+            decision = self._history[-1]
+            remaining = [t for t in decision.options if t not in decision.tried]
+
+            if not remaining:
+                # Every option of this decision failed: undo it and go up one level
+                self._restore(decision)
+                self._history.pop()
+                continue
+
+            if self._retries_since_best >= self.STUCK_RETRIES:
+                self._on_stuck_episode(pos)
+                return
+
+            if self._backtracks >= self.MAX_BACKTRACKS:
+                break
+
+            self._restore(decision)
+            self._backtracks += 1
+            self._retries_since_best += 1
+            if self._apply_choice(decision, random.choice(remaining)) is None:
+                self._note_progress()
+                return
+
+        self._mark_cross(pos)
+
+    def _mark_cross(self, pos: Tuple[int, int]):
+        """Give up on pos: it stays empty as a cross and the run continues elsewhere."""
+        self._dead.add(pos)
+        self._history.clear()
+        self._backtracks = 0
+        cell = self.cells.get(pos)
+        if cell is not None and not cell.is_collapsed:
+            cell.possibilities = set()
+        self.contradiction_found.emit(pos[0], pos[1])
+        self.cell_updated.emit(pos[0], pos[1])
+
+    def _on_stuck_episode(self, pos: Tuple[int, int]):
+        """
+        Retries keep failing: continue from the most open free cell instead of waiting.
+        Pauses only when no free cell is left or restarts keep failing without progress.
+        """
+        target = None
+        if self._jumps_since_best < self.MAX_AUTO_JUMPS:
+            target = self._most_open_free_cell(exclude=pos)
+        if target is None:
+            self._pause_stuck(pos)
+            return
+
+        self._jumps_since_best += 1
+        self._history.clear()
+        self._backtracks = 0
+        self._retries_since_best = 0
+        starts = [p for p in self._starts if p != self._auto_start]
+        self._auto_start = target
+        self._set_starts(starts + [target])
+        self.auto_start.emit(target[0], target[1])
+
+    def _most_open_free_cell(self, exclude: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        """Open cell with the most open neighbours, ties broken at random."""
+        best_score, ties = -1, []
+        for pos, cell in self.cells.items():
+            if cell.is_collapsed or pos in self._dead or pos == exclude or not cell.possibilities:
+                continue
+            score = sum(
+                1 for nx, ny, _ in self._get_neighbors_with_sides(*pos)
+                if not self.cells[(nx, ny)].is_collapsed and (nx, ny) not in self._dead
+            )
+            if score > best_score:
+                best_score, ties = score, [pos]
+            elif score == best_score:
+                ties.append(pos)
+        return random.choice(ties) if ties else None
+
+    def _pause_stuck(self, pos: Tuple[int, int]):
+        """Pause because retries keep failing without new progress; the user marks a new start cell."""
+        self._timer.stop()
+        self.state = EngineState.PAUSED
+        self.stuck.emit(pos[0], pos[1])
+
+    def _note_progress(self):
+        """Reset the stuck counter when the run reaches a new maximum of collapsed cells."""
+        if self._collapsed_count > self._best_collapsed:
+            self._best_collapsed = self._collapsed_count
+            self._retries_since_best = 0
+            self._jumps_since_best = 0
+
+    def is_cross(self, x: int, y: int) -> bool:
+        """True if (x, y) is an open cell the run has given up on."""
+        cell = self.cells.get((x, y))
+        return cell is not None and not cell.is_collapsed and (x, y) in self._dead
+
+    def cross_positions(self) -> List[Tuple[int, int]]:
+        return sorted(p for p in self._dead if self.is_cross(*p))
+
+    def _restore(self, decision: Decision):
+        """Undo all cell changes made under a decision."""
+        for pos, (possibilities, tile_id) in decision.changes.items():
+            cell = self.cells[pos]
+            cell.possibilities = set(possibilities)
+            cell.collapsed_tile = tile_id
+            self.cell_updated.emit(pos[0], pos[1])
+        decision.changes = {}
+
+        self._collapsed_count = sum(1 for c in self.cells.values() if c.is_collapsed)
+        self.progress_updated.emit(self._collapsed_count, self._total_cells)
+
+    def _record(self, cell: CellState):
+        """Remember a cell's state before its first change under the current decision."""
+        if not self._history:
+            return
+        self._history[-1].changes.setdefault(
+            (cell.x, cell.y), (set(cell.possibilities), cell.collapsed_tile)
+        )
+
+    def _clear_history(self):
+        self._history.clear()
+        self._backtracks = 0
+        self._retries_since_best = 0
+        self._best_collapsed = -1
+        self._jumps_since_best = 0
+
+    def force_place(self, x: int, y: int, tile_id: str, start_point: bool = False):
+        """
+        Place tile_id on a cell even if it conflicts with its neighbors.
+        Unlocked neighbors that conflict with it are cleared; locked ones are kept.
+        """
+        if (x, y) not in self.cells or self.atlas is None:
+            return
+
+        for nx, ny, side in self._get_neighbors_with_sides(x, y):
+            neighbor = self.cells[(nx, ny)]
+            if not neighbor.is_collapsed or neighbor.locked:
+                continue
+
+            opposite = {'left': 'right', 'right': 'left',
+                       'top': 'bottom', 'bottom': 'top'}[side]
+            compatible = (
+                self.atlas.can_be_neighbor(tile_id, side, neighbor.collapsed_tile)
+                and self.atlas.can_be_neighbor(neighbor.collapsed_tile, opposite, tile_id)
+            )
+            if not compatible:
+                self.unlock_cell(nx, ny)
+
+        self.lock_cell(x, y, tile_id, start_point)
     
+    def _set_starts(self, starts: List[Tuple[int, int]]):
+        """Replace the start points and recompute each cell's distance to the nearest one."""
+        self._starts = list(starts)
+        self._start_dist = {}
+        queue = deque()
+        for p in self._starts:
+            if p not in self._start_dist:
+                self._start_dist[p] = 0
+                queue.append(p)
+        while queue:
+            x, y = queue.popleft()
+            for nx, ny, _ in self._get_neighbors_with_sides(x, y):
+                if (nx, ny) not in self._start_dist:
+                    self._start_dist[(nx, ny)] = self._start_dist[(x, y)] + 1
+                    queue.append((nx, ny))
+
+    def _drop_starts(self, positions: List[Tuple[int, int]]):
+        """Forget any start points among positions (they were cleared)."""
+        gone = set(positions)
+        if any(p in gone for p in self._starts):
+            self._set_starts([p for p in self._starts if p not in gone])
+
     def _weighted_choice(self, possibilities: Set[str]) -> str:
         """Choose a tile weighted by rule weights."""
         if not possibilities:
@@ -310,7 +607,7 @@ class WFCEngine(QObject):
         # Could be enhanced to use actual weights from rules
         return random.choice(list(possibilities))
     
-    def _propagate(self, start_x: int, start_y: int):
+    def _propagate(self, start_x: int, start_y: int) -> Optional[Tuple[int, int]]:
         """Propagate constraints from collapsed cells."""
         from collections import deque
         queue = deque()
@@ -325,7 +622,8 @@ class WFCEngine(QObject):
             x, y = queue.popleft()
             
             cell = self.cells.get((x, y))
-            if cell is None or cell.is_collapsed:
+            # Crosses are skipped: an empty cell the run gave up on must not block propagation again
+            if cell is None or cell.is_collapsed or (x, y) in self._dead:
                 continue
             
             # Recalculate ALL valid possibilities for this cell
@@ -353,13 +651,13 @@ class WFCEngine(QObject):
             
             # Update if changed
             if valid != cell.possibilities:
-                old_possibilities = cell.possibilities
+                self._record(cell)
                 cell.possibilities = valid
                 self.cell_updated.emit(x, y)
-                
+
                 if len(valid) == 0:
                     # Contradiction
-                    return
+                    return (x, y)
                 elif len(valid) == 1:
                     # Auto-collapse
                     tile = next(iter(valid))
@@ -378,6 +676,8 @@ class WFCEngine(QObject):
                         nn = self.cells.get((nnx, nny))
                         if nn and not nn.is_collapsed:
                             queue.append((nnx, nny))
+
+        return None
     
     def _get_neighbors(self, x: int, y: int) -> List[Tuple[int, int]]:
         """Get valid neighbor positions."""
@@ -442,6 +742,93 @@ class WFCEngine(QObject):
         
         return valid
     
+    def get_neighbor_constraints(self, x: int, y: int) -> List[NeighborConstraint]:
+        """Constraint each collapsed neighbour puts on cell (x, y), in both adjacency directions."""
+        if self.atlas is None:
+            return []
+
+        constraints = []
+        for nx, ny, side in self._get_neighbors_with_sides(x, y):
+            neighbor = self.cells[(nx, ny)]
+            if not neighbor.is_collapsed:
+                continue
+
+            opposite = {'left': 'right', 'right': 'left',
+                       'top': 'bottom', 'bottom': 'top'}[side]
+            neighbor_permits = set(self.atlas.get_valid_neighbors(neighbor.collapsed_tile, opposite).keys())
+            cell_permits = self.atlas.get_tiles_allowing_neighbor(side, neighbor.collapsed_tile)
+            constraints.append(NeighborConstraint(
+                side=side,
+                pos=(nx, ny),
+                tile_id=neighbor.collapsed_tile,
+                locked=neighbor.locked,
+                allowed=neighbor_permits & cell_permits,
+                neighbor_permits=neighbor_permits,
+                cell_permits=cell_permits,
+            ))
+        return constraints
+
+    @staticmethod
+    def _missing_rule(c: NeighborConstraint) -> str:
+        """Which one-directional rule is absent for this neighbour, or '' if both directions have rules."""
+        opposite = {'left': 'right', 'right': 'left', 'top': 'bottom', 'bottom': 'top'}[c.side]
+        if not c.neighbor_permits:
+            return f"{c.tile_id} has no rules on its {opposite} side"
+        if not c.cell_permits:
+            return f"no tile has {c.tile_id} on its {c.side} side"
+        return ""
+
+    def find_minimal_conflict(self, x: int, y: int) -> List[NeighborConstraint]:
+        """Smallest group of neighbours whose constraints together leave no tile. Empty if none."""
+        constraints = self.get_neighbor_constraints(x, y)
+        for size in range(1, len(constraints) + 1):
+            for group in combinations(constraints, size):
+                if not set.intersection(*(c.allowed for c in group)):
+                    return list(group)
+        return []
+
+    def describe_conflict(self, x: int, y: int) -> str:
+        """Human-readable explanation of why cell (x, y) has no valid tile."""
+        constraints = self.get_neighbor_constraints(x, y)
+        if not constraints:
+            return f"Cell ({x}, {y}): no collapsed neighbours to blame."
+
+        lines = [f"Cell ({x}, {y}) has no valid tile.", "Neighbours:"]
+        for c in constraints:
+            tag = " [locked]" if c.locked else ""
+            permitted = sorted(c.allowed)
+            shown = ", ".join(permitted[:8]) + (", …" if len(permitted) > 8 else "")
+            lines.append(
+                f"  {c.side} ({c.pos[0]}, {c.pos[1]}): {c.tile_id}{tag} "
+                f"→ cell may be: {shown or 'none'}"
+            )
+
+        culprits = self.find_minimal_conflict(x, y)
+        if culprits:
+            names = " + ".join(f"{c.side} {c.tile_id} at ({c.pos[0]}, {c.pos[1]})" for c in culprits)
+            lines.append(f"Smallest conflicting set: {names}")
+            missing = [r for r in (self._missing_rule(c) for c in culprits) if r]
+            if missing:
+                lines.extend(f"Missing rule: {r}" for r in missing)
+            elif len(culprits) == 1:
+                lines.append(f"Missing rule: {culprits[0].tile_id}'s rules on its two sides disagree")
+            else:
+                lines.append("Missing rule: these neighbours have options, but none is shared by all")
+        else:
+            lines.append("No direct neighbour conflict: the cause is an earlier choice further away.")
+        return "\n".join(lines)
+
+    def explain_tile(self, x: int, y: int, tile_id: str) -> str:
+        """Why tile_id cannot go at (x, y), one line per neighbour that rejects it. Empty if none does."""
+        reasons = []
+        for c in self.get_neighbor_constraints(x, y):
+            opposite = {'left': 'right', 'right': 'left', 'top': 'bottom', 'bottom': 'top'}[c.side]
+            if tile_id not in c.neighbor_permits:
+                reasons.append(f"{c.tile_id} has no rule allowing {tile_id} on its {opposite} side")
+            elif tile_id not in c.cell_permits:
+                reasons.append(f"{tile_id} has no rule listing {c.tile_id} on its {c.side} side")
+        return "\n".join(reasons)
+
     def validate_grid(self) -> List[str]:
         """
         Validate all adjacencies in the current grid.

@@ -2,6 +2,7 @@
 Zoomable, pannable grid canvas for WFC visualization.
 """
 
+from pathlib import Path
 from typing import Optional, Dict, Tuple
 
 from PySide6.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QGraphicsRectItem
@@ -73,8 +74,6 @@ class GridCanvas(QGraphicsView):
         self._uncollapsed_pixmap: Optional[QPixmap] = None
         self._error_pixmap: Optional[QPixmap] = None
         
-        # Contradiction position
-        self._contradiction_pos: Optional[Tuple[int, int]] = None
     
     def set_engine(self, engine: WFCEngine):
         """Connect to a WFC engine."""
@@ -95,7 +94,6 @@ class GridCanvas(QGraphicsView):
         """Setup the grid with given dimensions."""
         self._grid_width = width
         self._grid_height = height
-        self._contradiction_pos = None
         
         # Clear scene
         self._scene.clear()
@@ -140,16 +138,20 @@ class GridCanvas(QGraphicsView):
         item = self._cell_items.get((x, y))
         if item is None:
             return
-        
+
+        item.setToolTip("")
         cell = self._engine.get_cell(x, y)
         if cell is None:
             return
-        
+
         if cell.is_collapsed:
             # Get tile pixmap
             variant = self._atlas.tiles.get(cell.collapsed_tile)
             if variant:
                 pixmap = variant.get_pixmap(self._atlas.base_tiles, self.CELL_SIZE)
+                base = self._atlas.base_tiles.get(variant.base_tile_id)
+                image_name = Path(base.source).name if base else "?"
+                item.setToolTip(f"{image_name}\n{variant.id}")
                 
                 # Add locked border if needed
                 if cell.locked:
@@ -160,8 +162,9 @@ class GridCanvas(QGraphicsView):
                 item.setBrush(QBrush(self._get_error_pixmap()))
         else:
             # Show uncollapsed state
-            if self._contradiction_pos == (x, y):
+            if self._engine.is_cross(x, y):
                 item.setBrush(QBrush(self._get_error_pixmap()))
+                item.setToolTip(self._engine.describe_conflict(x, y))
             else:
                 item.setBrush(QBrush(self._get_uncollapsed_pixmap()))
     
@@ -197,14 +200,12 @@ class GridCanvas(QGraphicsView):
         self.update_cell(x, y)
     
     def _on_contradiction(self, x: int, y: int):
-        """Handle contradiction signal."""
-        self._contradiction_pos = (x, y)
+        """Handle a cell being marked as a cross."""
         self.update_cell(x, y)
-    
+
     def _on_state_changed(self, state: EngineState):
         """Handle engine state change."""
         if state == EngineState.IDLE:
-            self._contradiction_pos = None
             self.update_all_cells()
     
     # === Input handling ===

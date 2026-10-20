@@ -18,6 +18,8 @@ from ..core.tr_loader import TRLoader
 from ..core.tm_saver import TMSaver, GridState
 from ..core.wfc_engine import WFCEngine, EngineState
 from ..utils.png_export import export_grid_to_png
+from ..utils.tiled_export import export_grid_to_tiled
+from ..utils.tiled_import import read_tmx
 
 from .grid_canvas import GridCanvas
 from .tile_dialog import TileDialog
@@ -151,6 +153,14 @@ class MainWindow(QMainWindow):
         self._open_btn.clicked.connect(self._on_open_tr)
         toolbar.addWidget(self._open_btn)
         
+        self._load_initial_btn = QPushButton("📥 Initial .tm")
+        self._load_initial_btn.clicked.connect(self._on_load_initial_tm)
+        toolbar.addWidget(self._load_initial_btn)
+
+        self._open_tiled_btn = QPushButton("📥 Open Tiled")
+        self._open_tiled_btn.clicked.connect(self._on_open_tiled)
+        toolbar.addWidget(self._open_tiled_btn)
+
         self._save_tm_btn = QPushButton("💾 Save .tm")
         self._save_tm_btn.clicked.connect(self._on_save_tm)
         toolbar.addWidget(self._save_tm_btn)
@@ -158,6 +168,10 @@ class MainWindow(QMainWindow):
         self._export_png_btn = QPushButton("🖼 Export PNG")
         self._export_png_btn.clicked.connect(self._on_export_png)
         toolbar.addWidget(self._export_png_btn)
+
+        self._export_tiled_btn = QPushButton("🗺 Export Tiled")
+        self._export_tiled_btn.clicked.connect(self._on_export_tiled)
+        toolbar.addWidget(self._export_tiled_btn)
         
         toolbar.addSeparator()
         
@@ -199,6 +213,11 @@ class MainWindow(QMainWindow):
         self._play_btn.setCheckable(True)
         self._play_btn.clicked.connect(self._on_play_pause)
         toolbar.addWidget(self._play_btn)
+
+        self._pause_mark_btn = QPushButton("⏸ Pause & Mark")
+        self._pause_mark_btn.setToolTip("Pause, then click an empty cell to start the run from it")
+        self._pause_mark_btn.clicked.connect(self._on_pause_and_mark)
+        toolbar.addWidget(self._pause_mark_btn)
         
         self._step_btn = QPushButton("⏭ Step")
         self._step_btn.clicked.connect(self._on_step)
@@ -238,6 +257,8 @@ class MainWindow(QMainWindow):
         self._engine.state_changed.connect(self._on_engine_state_changed)
         self._engine.progress_updated.connect(self._on_progress_updated)
         self._engine.finished.connect(self._on_collapse_finished)
+        self._engine.stuck.connect(self._on_stuck)
+        self._engine.auto_start.connect(self._on_auto_start)
     
     def _update_ui_state(self):
         """Update UI enabled states based on current state."""
@@ -245,8 +266,12 @@ class MainWindow(QMainWindow):
         is_running = self._engine.state == EngineState.RUNNING
         is_idle_or_paused = self._engine.state in (EngineState.IDLE, EngineState.PAUSED)
         
+        self._load_initial_btn.setEnabled(has_atlas)
+        self._open_tiled_btn.setEnabled(has_atlas)
+        self._pause_mark_btn.setEnabled(has_atlas)
         self._save_tm_btn.setEnabled(has_atlas)
         self._export_png_btn.setEnabled(has_atlas)
+        self._export_tiled_btn.setEnabled(has_atlas)
         self._apply_size_btn.setEnabled(has_atlas)
         self._play_btn.setEnabled(has_atlas and self._engine.state != EngineState.FINISHED)
         self._step_btn.setEnabled(has_atlas and is_idle_or_paused)
@@ -350,6 +375,120 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save file:\n{e}")
     
     @Slot()
+    def _on_open_tiled(self):
+        """Open a Tiled map: its size becomes the grid and its tiles become fixed cells."""
+        if self._atlas is None:
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open Tiled Map",
+            "", "Tiled Map (*.tmx);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        try:
+            tmap = read_tmx(filepath)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open Tiled map:\n{e}")
+            return
+
+        self._width_spin.setValue(tmap.width)
+        self._height_spin.setValue(tmap.height)
+        self._engine.initialize(self._atlas, tmap.width, tmap.height)
+        self._canvas.setup_grid(tmap.width, tmap.height)
+
+        enabled = self._atlas.get_enabled_tile_ids()
+        applied = skipped = 0
+        for (x, y), tile_id in tmap.cells.items():
+            # Tiles without a tile_id property, or not in the open .tr, cannot be placed
+            if tile_id is None or tile_id not in enabled:
+                skipped += 1
+                continue
+            self._engine.lock_cell(x, y, tile_id)
+            applied += 1
+
+        self._canvas.update_all_cells()
+        message = f"Opened Tiled map {tmap.width}×{tmap.height} with {applied} tiles from {Path(filepath).name}"
+        if skipped:
+            message += f" ({skipped} skipped: unknown or unnamed tile)"
+        self._status_label.setText(message)
+        self._update_ui_state()
+
+    @Slot()
+    def _on_load_initial_tm(self):
+        """Lock the cells of a .tm file as starting constraints, then restart the run."""
+        if self._atlas is None:
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Load Initial Cells from Tile Map",
+            "", "Tile Map (*.tm);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        try:
+            grid_state, _ = TMSaver.load(filepath)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load tile map:\n{e}")
+            return
+
+        # The tile map defines the grid size, so adopt it
+        width, height = grid_state.width, grid_state.height
+        self._width_spin.setValue(width)
+        self._height_spin.setValue(height)
+        self._engine.initialize(self._atlas, width, height)
+        self._canvas.setup_grid(width, height)
+
+        enabled = self._atlas.get_enabled_tile_ids()
+        applied = skipped = 0
+
+        for (x, y), cell_data in grid_state.cells.items():
+            if not cell_data.tile_id:
+                continue
+            # Skip tiles that are not in the open .tr
+            if cell_data.tile_id not in enabled:
+                skipped += 1
+                continue
+            self._engine.lock_cell(x, y, cell_data.tile_id)
+            applied += 1
+
+        # Restart with the new locks in place (reset keeps locked cells)
+        self._engine.reset()
+        self._canvas.update_all_cells()
+
+        message = f"Loaded {width}×{height} grid with {applied} initial cells from {Path(filepath).name}"
+        if skipped:
+            message += f" ({skipped} skipped: unknown tile)"
+        self._status_label.setText(message)
+        self._update_ui_state()
+
+    @Slot()
+    def _on_export_tiled(self):
+        if self._atlas is None:
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Tiled Map",
+            "", "Tiled Map (*.tmx);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        if not filepath.endswith('.tmx'):
+            filepath += '.tmx'
+
+        try:
+            info = export_grid_to_tiled(filepath, self._engine, self._atlas)
+            self._status_label.setText(
+                f"Exported Tiled map {info['width']}×{info['height']} "
+                f"({info['tiles']} tiles) to {Path(filepath).name}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export Tiled map:\n{e}")
+
+    @Slot()
     def _on_export_png(self):
         if self._atlas is None:
             return
@@ -425,6 +564,9 @@ class MainWindow(QMainWindow):
         if self._atlas is None:
             return
         
+        # Tiles chosen while the run is paused (stuck or manual) become start points
+        was_paused = self._engine.state == EngineState.PAUSED
+
         # Pause if running
         was_running = self._engine.state == EngineState.RUNNING
         if was_running:
@@ -432,19 +574,35 @@ class MainWindow(QMainWindow):
         
         # Get valid tiles for this position
         valid_tiles = self._engine.get_valid_tiles_for_cell(x, y)
-        
+        cell = self._engine.get_cell(x, y)
+        is_cross = self._engine.is_cross(x, y)
+        conflict = self._engine.describe_conflict(x, y) if is_cross else ""
+
         # Show dialog
         result = TileDialog.get_tile(
-            self._atlas, x, y, valid_tiles, self
+            self._atlas, x, y, valid_tiles, self, conflict=conflict,
+            explain=lambda tile_id: self._engine.explain_tile(x, y, tile_id)
         )
-        
+
         if result is not None:
             if result:  # tile_id selected (non-empty string)
-                self._engine.lock_cell(x, y, result)
-                self._canvas.update_cell(x, y)
+                if is_cross:
+                    self._engine.force_place(x, y, result, start_point=was_paused)
+                else:
+                    self._engine.lock_cell(x, y, result, start_point=was_paused)
+                self._canvas.update_all_cells()
+                if was_paused:
+                    self._status_label.setText(
+                        f"Start point set at ({x}, {y}). Press Play to continue from there."
+                    )
             else:  # Clear requested (empty string "")
-                self._engine.unlock_cell(x, y)
-                self._canvas.update_cell(x, y)
+                cleared, locked = self._engine.clear_cell_and_forcing_neighbors(x, y)
+                self._canvas.update_all_cells()
+                if len(cleared) > 1:
+                    self._status_label.setText(
+                        f"Cleared {len(cleared)} cells to free ({x}, {y})"
+                        + (f", including {locked} locked" if locked else "")
+                    )
         # result is None = cancelled, do nothing
         
         # Resume if was running
@@ -494,7 +652,30 @@ class MainWindow(QMainWindow):
             else:
                 self._status_label.setText("Collapse complete! (valid)")
         else:
-            self._status_label.setText("Contradiction found!")
+            crosses = len(self._engine.cross_positions())
+            self._status_label.setText(
+                f"Finished with {crosses} unresolved cell(s). Click a ✖ cell to fix it."
+            )
+        self._update_ui_state()
+
+    @Slot(int, int)
+    def _on_stuck(self, x: int, y: int):
+        self._status_label.setText(
+            f"Stuck near ({x}, {y}) and no free cell left to try. "
+            "Click an empty cell to mark a start point, then press Play."
+        )
+        self._update_ui_state()
+
+    @Slot(int, int)
+    def _on_auto_start(self, x: int, y: int):
+        self._status_label.setText(f"Stuck; continuing from the most open cell ({x}, {y}).")
+        self._update_ui_state()
+
+    @Slot()
+    def _on_pause_and_mark(self):
+        if self._engine.state == EngineState.RUNNING:
+            self._engine.pause()
+        self._status_label.setText("Paused. Click an empty cell to set it as the start point, then press Play.")
         self._update_ui_state()
     
     def keyPressEvent(self, event):
